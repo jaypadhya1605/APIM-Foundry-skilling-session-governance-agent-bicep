@@ -1,0 +1,104 @@
+<!--
+  ============================================================================
+  PRODUCT SCOPE  |  Foundry — Team Revenue Cycle   (SESSION 2: governed)
+  ============================================================================
+  Same governance stack, different numbers. Show these two files side by side:
+  the identical control surface, tuned per team, with no bespoke APIM work for
+  either. That is what "turnkey onboarding" has to mean in practice — a new
+  team is a new copy of this file with four values changed, not a design
+  exercise.
+
+  This team is high-volume back-office denial triage: more tokens per minute,
+  a bigger monthly envelope, a lower reasoning tier, and a looser Violence
+  threshold because denial narratives quote clinical text verbatim.
+
+  The deliberate difference from cardiology is the token-quota behaviour on
+  exhaustion. Clinical traffic must degrade loudly and be seen. Batch traffic
+  should throttle and drain. Same policy, different operational contract, and
+  it is worth saying out loud that this is a business decision the platform
+  team should not be making alone.
+  ============================================================================
+-->
+<policies>
+  <inbound>
+    <base />
+
+    <!-- ══ UNCHANGED FROM SESSION 1 ═════════════════════════════════════ -->
+    <!-- Deliberately a project this team does NOT own, so the 403 in the demo
+         is real rather than staged. -->
+    <set-variable name="allowedProjects" value="proj-revcycle-sandbox" />
+    <set-variable name="reasoningEffortDefault" value="low" />
+    <set-variable name="costCenter" value="CC-62205-REVCYCLE" />
+    <set-variable name="serviceTier" value="back-office-bulk" />
+
+    <!-- ══ SESSION 2 GOVERNANCE STACK ═══════════════════════════════════ -->
+
+    <!-- Model resolution at product scope. See the long note in
+         product-team-cardiology-governed.xml: inbound policies run
+         global → PRODUCT → api → operation, so a variable set by the API
+         policy does not exist yet, and llm-emit-token-metric would emit
+         Model="unresolved" for every request without complaining. -->
+    <set-variable name="modelName" value="@{
+        var m = System.Text.RegularExpressions.Regex.Match(context.Request.Url.Path, @&quot;/deployments/([^/?]+)&quot;);
+        if (m.Success) { return m.Groups[1].Value; }
+        var body = context.Request.Body?.As&lt;JObject&gt;(preserveContent: true);
+        return body?[&quot;model&quot;]?.ToString() ?? &quot;unresolved&quot;;
+    }" />
+
+    <!-- 4x the TPM of the clinical product, 6x the monthly envelope. Bulk
+         work is the reason the platform needs a quota at all: it is the only
+         workload capable of consuming a month of budget in an afternoon. -->
+    <llm-token-limit counter-key="@((string)context.Subscription.Id)"
+                     tokens-per-minute="80000"
+                     token-quota="90000000"
+                     token-quota-period="Monthly"
+                     estimate-prompt-tokens="false"
+                     retry-after-header-name="retry-after"
+                     remaining-quota-tokens-header-name="x-prov-quota-tokens-remaining"
+                     remaining-tokens-header-name="x-prov-tpm-remaining"
+                     tokens-consumed-header-name="x-prov-tokens-consumed" />
+
+    <!-- Violence relaxed to 6. Denial-of-claim narratives quote injury
+         descriptions verbatim from the clinical record; at threshold 2 this
+         product would block a material share of legitimate traffic. Note that
+         this is a per-product decision made with evidence, which is precisely
+         the flexibility a single account-wide deployment filter cannot give
+         you. -->
+    <llm-content-safety backend-id="content-safety" shield-prompt="true">
+      <categories output-type="EightSeverityLevels">
+        <category name="Hate" threshold="2" />
+        <category name="SelfHarm" threshold="4" />
+        <category name="Sexual" threshold="2" />
+        <category name="Violence" threshold="6" />
+      </categories>
+    </llm-content-safety>
+
+    <!-- Identical dimension set to cardiology. This is not duplication for its
+         own sake: the dimensions MUST match across every product or the
+         chargeback report cannot union them into one table. Treat this block
+         as a platform-wide contract and change it in one pull request across
+         all products, never per team. -->
+    <llm-emit-token-metric namespace="providence-ai-gateway">
+      <dimension name="CostCenter" value="@((string)context.Variables["costCenter"])" />
+      <dimension name="Team" value="@(context.Product?.Id ?? "unscoped")" />
+      <dimension name="App" value="@(context.Subscription?.Id ?? "anonymous")" />
+      <dimension name="Model" value="@(context.Variables.ContainsKey("modelName") ? (string)context.Variables["modelName"] : "unresolved")" />
+      <dimension name="ServiceTier" value="@((string)context.Variables["serviceTier"])" />
+      <dimension name="ApiId" value="@(context.Api.Id)" />
+    </llm-emit-token-metric>
+  </inbound>
+
+  <backend><base /></backend>
+
+  <outbound>
+    <base />
+    <set-header name="x-prov-cost-center" exists-action="override">
+      <value>@((string)context.Variables["costCenter"])</value>
+    </set-header>
+    <set-header name="x-prov-service-tier" exists-action="override">
+      <value>@((string)context.Variables["serviceTier"])</value>
+    </set-header>
+  </outbound>
+
+  <on-error><base /></on-error>
+</policies>

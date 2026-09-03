@@ -1,0 +1,71 @@
+<!--
+  ============================================================================
+  API SCOPE  |  content-safety-internal   (path: /internal/content-safety)
+  ============================================================================
+  WHY THIS API EXISTS — and it is not a workaround, it is the pattern
+  ====================================================================
+  `llm-content-safety` calls an APIM backend, and an APIM backend authenticates
+  with a static credential. Providence's Foundry account has local auth
+  disabled — verified on this account:
+
+      az cognitiveservices account keys list ...
+      -> BadRequest: Failed to list key. disableLocalAuth is set to be true
+
+  That is the correct posture and it should not be relaxed to make a policy
+  work. There is no key to put in the backend, so the backend cannot call
+  Content Safety directly.
+
+  The mediation pattern: expose Content Safety as an internal APIM API whose
+  policy attaches the gateway's own managed identity, then point the
+  `content-safety` backend at that API. The keyless boundary moves from the
+  backend definition to a policy, which is where it can be expressed.
+
+  The same shape solves every "this Azure feature wants a key and our tenant
+  policy forbids keys" problem, so it is worth Providence knowing generally.
+
+  WHAT IT COSTS
+  =============
+    * One extra internal hop per governed request. Same gateway, same region,
+      but it is not free — budget a few milliseconds and expect the APIM
+      request count to roughly double, which matters on a per-request SKU.
+    * The self-call must not re-enter the governance stack, or a content-safety
+      check would trigger a content-safety check. It is isolated in its own
+      product with an empty policy for exactly that reason.
+
+  WHAT IT BUYS
+  ============
+    * No key anywhere: not in the backend, not in a named value, not in a repo.
+    * Content Safety access is governed by an Azure RBAC role assignment on the
+      gateway identity, which is revocable, auditable and reviewable in the
+      same place as every other Azure permission.
+  ============================================================================
+-->
+<policies>
+  <inbound>
+    <base />
+
+    <!-- The gateway's system-assigned identity holds Cognitive Services User on
+         the Foundry account — granted in 01-platform.bicep. Nothing else is
+         needed; there is no secret to rotate and nothing to leak. -->
+    <authentication-managed-identity resource="https://cognitiveservices.azure.com"
+                                     output-token-variable-name="cs-token"
+                                     ignore-error="false" />
+    <set-header name="Authorization" exists-action="override">
+      <value>@("Bearer " + (string)context.Variables["cs-token"])</value>
+    </set-header>
+
+    <!-- Strip the internal subscription key before it leaves the gateway. It
+         authenticates the caller TO APIM and has no meaning to Content Safety;
+         forwarding it would put an APIM credential in another service's logs. -->
+    <set-header name="Ocp-Apim-Subscription-Key" exists-action="delete" />
+  </inbound>
+  <backend>
+    <forward-request buffer-request-body="true" timeout="20" />
+  </backend>
+  <outbound>
+    <base />
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

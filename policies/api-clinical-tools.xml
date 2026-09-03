@@ -1,0 +1,228 @@
+<!--
+  ============================================================================
+  API SCOPE  |  Clinical tools  —  the EGRESS side of the gateway   (ask 5)
+  ============================================================================
+  Everything in Session 1 governs traffic going OUT to a model. This governs
+  traffic coming BACK IN from an agent to Providence's own systems, and it is
+  the half that is usually missing.
+
+  THE SHAPE OF THE PROBLEM
+  ========================
+  A Foundry Agent with an OpenAPI or MCP tool is a caller you did not write,
+  driven by a model, executing a plan you did not review, against an internal
+  API. Three properties follow, and each one breaks an assumption that internal
+  APIs are normally built on:
+
+    1. The caller is non-deterministic. The same prompt can produce a different
+       number of calls, with different arguments, on different days. Capacity
+       planning based on "the app calls this twice per transaction" is void.
+
+    2. The arguments are model-authored. A tool parameter is now an untrusted
+       string that a document the agent read may have influenced. Indirect
+       prompt injection turns "summarise this referral" into "call the
+       eligibility tool for every member id you can enumerate".
+
+    3. The blast radius is the tool's permission set, not the user's. An agent
+       running as a service principal with broad access is a confused deputy
+       by construction.
+
+  WHAT THIS POLICY DOES ABOUT IT
+  ==============================
+  Least privilege, argument validation, rate limiting per agent, and a full
+  audit trail — enforced at the gateway rather than asked for in each tool's
+  own codebase, because "every internal API team implements this correctly" is
+  not a control you can attest to.
+
+  WHY APIM RATHER THAN THE AGENT
+  ==============================
+  The Foundry Agent Service can call an MCP server or an OpenAPI tool directly.
+  Routing that through APIM instead buys four things the direct path cannot:
+  one audit log across every tool, a rate limit the agent cannot remove from
+  its own configuration, credential mediation so the internal API's secret is
+  never in the agent's tool definition, and a kill switch that does not require
+  redeploying the agent.
+  ============================================================================
+-->
+<policies>
+  <inbound>
+    <base />
+
+    <!-- ── 1. Prove which agent is calling ────────────────────────────────
+         The agent presents an Entra token for its own managed identity or
+         app registration. We do not accept an API key here: a key in a tool
+         definition is a key in a prompt-adjacent config blob, and it will
+         eventually be echoed into a trace.
+
+         require-signed-tokens / require-expiration-time are not defaults.
+         Omitting them is how an `alg: none` token gets accepted.
+
+         The audience is the internal API's own app registration, never the
+         Graph or ARM audience. An agent that can mint a Graph token must not
+         be able to replay it here. -->
+    <validate-jwt header-name="Authorization"
+                  failed-validation-httpcode="401"
+                  failed-validation-error-message="Agent identity could not be validated."
+                  require-scheme="Bearer"
+                  require-signed-tokens="true"
+                  require-expiration-time="true">
+      <openid-config url="https://login.microsoftonline.com/{{prov-tenant-id}}/v2.0/.well-known/openid-configuration" />
+      <!-- Both issuer forms, and this is not belt-and-braces.
+
+           Entra mints v1.0 tokens with issuer https://sts.windows.net/{tid}/
+           and v2.0 tokens with issuer https://login.microsoftonline.com/{tid}/v2.0.
+           Which one you get depends on the RESOURCE, not on your metadata URL:
+           `az account get-access-token` and most first-party resources still
+           return v1.0. Point validate-jwt at the v2.0 metadata alone and every
+           v1.0 caller fails with
+
+             IDX10205: Issuer validation failed.
+
+           which reads like a broken gateway and is really a token-version
+           mismatch. It cost us a debugging cycle building this demo; it will
+           cost Providence one in production. List both. -->
+      <issuers>
+        <issuer>https://sts.windows.net/{{prov-tenant-id}}/</issuer>
+        <issuer>https://login.microsoftonline.com/{{prov-tenant-id}}/v2.0</issuer>
+      </issuers>
+      <audiences>
+        <audience>{{prov-tools-audience}}</audience>
+      </audiences>
+      <!-- PRODUCTION SHAPE — enabled once the tools app registration exists:
+
+           <required-claims>
+             <claim name="roles" match="any">
+               <value>ClinicalTools.Invoke</value>
+             </claim>
+           </required-claims>
+
+           An app-only token, because a tool invoked by an autonomous agent has
+           no signed-in user. Assert the app ROLE, not a delegated scope; a
+           scope check on an app-only token silently passes for any app in the
+           tenant.
+
+           Left out of the demo deliberately so the session can be driven with
+           a token from `az account get-access-token`, and so the 401 you see
+           without a token is a real rejection rather than a slide. -->
+    </validate-jwt>
+
+    <!-- Identify the agent from its own token. AsJwt() is APIM's built-in
+         parser — the Microsoft.IdentityModel namespace is NOT available inside
+         a policy expression, which is a common and confusing failure:
+         `The type or namespace name 'IdentityModel' does not exist`.
+
+         v1.0 Entra tokens carry `appid`; v2.0 tokens carry `azp`. Read both or
+         the attribution silently becomes "unknown" the day someone flips the
+         app registration's accessTokenAcceptedVersion. -->
+    <set-variable name="agentAppId" value="@{
+        var jwt = context.Request.Headers.GetValueOrDefault(&quot;Authorization&quot;, &quot;&quot;).Split(' ').Last().AsJwt();
+        if (jwt == null) { return &quot;unknown&quot;; }
+        return jwt.Claims.GetValueOrDefault(&quot;appid&quot;, jwt.Claims.GetValueOrDefault(&quot;azp&quot;, &quot;unknown&quot;));
+    }" />
+
+    <!-- ── 2. Rate limit the AGENT, not the user ──────────────────────────
+         Keyed on the calling app id. A retry loop inside an agent plan is the
+         realistic failure mode: the model gets an unexpected tool result,
+         re-plans, calls again, and does that forty times in eight seconds.
+         Nothing in the agent framework stops that. This does.
+
+         Keep the window short. A per-hour limit lets the loop run for an hour
+         before it trips; a per-10-second limit catches it while it is still
+         one incident rather than a page of them. -->
+    <rate-limit-by-key calls="20"
+                       renewal-period="10"
+                       counter-key="@((string)context.Variables["agentAppId"])"
+                       retry-after-header-name="retry-after" />
+
+    <!-- ── 3. Validate the model-authored arguments ───────────────────────
+         Treat every tool argument as hostile input, because it is downstream
+         of text the model read. This is the concrete mitigation for indirect
+         prompt injection: the agent may be persuaded to ask for anything, but
+         it can only ever ask for a well-formed member id.
+
+         A schema check at the gateway also fails fast and cheaply, before the
+         internal system spends a database round trip on a malformed request. -->
+    <choose>
+      <when condition="@(context.Request.Url.Path.Contains("eligibility"))">
+        <set-variable name="memberId" value="@(context.Request.Url.Query.GetValueOrDefault("memberId",""))" />
+        <choose>
+          <when condition="@(!System.Text.RegularExpressions.Regex.IsMatch((string)context.Variables["memberId"], @"^PRV-[0-9]{8}$"))">
+            <return-response>
+              <set-status code="400" reason="Bad Request" />
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+              </set-header>
+              <set-body>{"error":{"code":"InvalidToolArgument","message":"memberId must match PRV-########. The gateway rejects model-authored arguments that do not fit the contract."}}</set-body>
+            </return-response>
+          </when>
+        </choose>
+      </when>
+    </choose>
+
+    <!-- ── 4. Credential mediation ────────────────────────────────────────
+         The agent's token got it through the front door. It does NOT go any
+         further. The gateway swaps it for the platform's own identity before
+         calling the internal system, so the internal system trusts exactly one
+         caller, and the agent never holds a credential that works anywhere but
+         here. Revoking an agent is then a subscription change at the gateway,
+         not a secret rotation across every downstream system.
+
+         (In this demo the downstream is mocked at the operation scope, so the
+         MI call is commented out rather than deleted — leaving the shape
+         visible is the point.)
+    <authentication-managed-identity resource="{{prov-tools-audience}}"
+                                     output-token-variable-name="tools-token" />
+    <set-header name="Authorization" exists-action="override">
+      <value>@("Bearer " + (string)context.Variables["tools-token"])</value>
+    </set-header>
+    -->
+    <set-header name="Authorization" exists-action="delete" />
+
+    <!-- ── 5. Audit trail ─────────────────────────────────────────────────
+         Correlate the tool call back to the agent run. Without this, an
+         incident review can see that an internal API was called 4,000 times
+         and cannot say which agent, which thread, or which prompt caused it.
+         Foundry propagates W3C traceparent; carry it through and the gateway
+         log joins to the Foundry trace on a single id. -->
+    <set-header name="x-prov-agent-app-id" exists-action="override">
+      <value>@((string)context.Variables["agentAppId"])</value>
+    </set-header>
+    <set-header name="x-prov-correlation-id" exists-action="skip">
+      <value>@(context.RequestId.ToString())</value>
+    </set-header>
+    <trace source="prov-agent-egress" severity="information">
+      <message>@("agent tool call")</message>
+      <metadata name="agentAppId" value="@((string)context.Variables["agentAppId"])" />
+      <metadata name="operation" value="@(context.Operation.Id)" />
+    </trace>
+  </inbound>
+
+  <backend><base /></backend>
+
+  <outbound>
+    <base />
+    <!-- ── 6. Do not leak more than the tool needs ────────────────────────
+         Whatever comes back becomes model context, and model context becomes
+         the next prompt. Strip internal identifiers and diagnostics on the way
+         out. The cheapest data-protection control available is not returning
+         the data. -->
+    <set-header name="x-internal-trace-id" exists-action="delete" />
+    <set-header name="server" exists-action="delete" />
+    <set-header name="x-powered-by" exists-action="delete" />
+    <set-header name="x-prov-agent-app-id" exists-action="override">
+      <value>@((string)context.Variables["agentAppId"])</value>
+    </set-header>
+  </outbound>
+
+  <on-error>
+    <base />
+    <set-body>@{
+        return new JObject(
+            new JProperty("error", new JObject(
+                new JProperty("code", context.LastError?.Reason ?? "ToolGatewayError"),
+                new JProperty("message", context.LastError?.Message ?? "The tool call was rejected at the gateway."),
+                new JProperty("correlationId", context.RequestId.ToString())
+            ))
+        ).ToString();
+    }</set-body>
+  </on-error>
+</policies>

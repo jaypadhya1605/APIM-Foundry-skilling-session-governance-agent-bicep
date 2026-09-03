@@ -1,0 +1,111 @@
+// =============================================================================
+// Gateway operations — throttling, failures, and who is being hurt by them
+// =============================================================================
+// SCOPE: Log Analytics workspace log-provdemo-... , table
+//        ApiManagementGatewayLogs (fed by the diagnostic setting in
+//        Session 1/infra/01-platform.bicep).
+//
+// The token metrics answer "what did it cost". These answer "is it healthy, and
+// for whom is it not". Both are needed: a platform that is cheap and unreliable
+// gets abandoned just as fast as one that is reliable and expensive.
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// 1. Throttling, split by WHO threw it
+// -----------------------------------------------------------------------------
+// The most important distinction in this whole file.
+//
+//   GATEWAY 429  = a Providence policy stopped the caller. Working as intended.
+//                  The team has hit its own budget. Nobody else is affected.
+//
+//   BACKEND 429  = Foundry stopped us. Shared capacity is exhausted. This is a
+//                  platform problem and it affects every team on that
+//                  deployment, including ones that are well behaved.
+//
+// Conflating the two is how a capacity incident gets misdiagnosed as an app
+// team problem for two days.
+ApiManagementGatewayLogs
+| where TimeGenerated > ago(24h)
+| where ResponseCode == 429 or BackendResponseCode == 429
+| extend Source = case(
+    BackendResponseCode == 429, "backend (Foundry capacity)",
+    "gateway (Providence policy)")
+| summarize Throttles = count() by bin(TimeGenerated, 15m), Source, ApiId, ProductId
+| order by TimeGenerated desc
+
+// -----------------------------------------------------------------------------
+// 2. Error budget by team and API
+// -----------------------------------------------------------------------------
+// ApiManagementGatewayLogs
+// | where TimeGenerated > ago(7d)
+// | summarize
+//     Total   = count(),
+//     Errors  = countif(ResponseCode >= 500),
+//     Client  = countif(ResponseCode >= 400 and ResponseCode < 500),
+//     P95Ms   = percentile(TotalTime, 95)
+//   by ProductId, ApiId
+// | extend ErrorRatePct = round(100.0 * Errors / Total, 2)
+// | order by ErrorRatePct desc
+
+// -----------------------------------------------------------------------------
+// 3. Content safety rejections — a leading indicator, not just a control
+// -----------------------------------------------------------------------------
+// A sudden spike in 403s from one application is worth a conversation. It is
+// usually one of three things, and they need very different responses:
+//   * a genuine misuse attempt                       -> security
+//   * a legitimate clinical use case tripping a low  -> tune the threshold for
+//     threshold (injury descriptions, self-harm         that product; do not
+//     screening, substance-abuse notes)                 tune it globally
+//   * a prompt template that changed and now looks   -> app team
+//     like an injection
+//
+// ApiManagementGatewayLogs
+// | where TimeGenerated > ago(7d)
+// | where ResponseCode == 403
+// | summarize Rejections = count() by bin(TimeGenerated, 1h), ProductId, ApiId
+// | render timechart
+
+// -----------------------------------------------------------------------------
+// 4. Agent egress audit — which agent touched which internal system
+// -----------------------------------------------------------------------------
+// The query a security review will ask for, and the one that has no answer at
+// all if agents call internal APIs directly instead of through the gateway.
+//
+// ApiManagementGatewayLogs
+// | where TimeGenerated > ago(7d)
+// | where ApiId == "clinical-tools"
+// | project TimeGenerated, OperationId, ResponseCode, CallerIpAddress,
+//           AgentAppId = tostring(parse_json(tostring(RequestHeaders))["x-prov-agent-app-id"]),
+//           CorrelationId = tostring(parse_json(tostring(RequestHeaders))["x-prov-correlation-id"])
+// | order by TimeGenerated desc
+
+// -----------------------------------------------------------------------------
+// 5. Billing reconciliation — gateway tokens vs. invoice
+// -----------------------------------------------------------------------------
+// Expect a gap. Chase it only if it is growing, and know the four usual causes
+// before you start:
+//
+//   1. SAMPLING. If the APIM diagnostic sampling percentage is below 100, the
+//      gateway under-reports by construction. Check this first, every time.
+//   2. STREAMING. Streamed responses do not always carry a usage block; the
+//      llm-* policies handle this, older azure-openai-* ones may not.
+//   3. BYPASS. Traffic that did not go through the gateway at all. This is the
+//      one that matters: it means the platform has a hole. Compare the gateway
+//      total against the Foundry resource's own metric.
+//   4. NON-CHAT WORKLOADS. Embeddings, transcription, image generation and
+//      realtime bill on different meters and may not be token-shaped.
+//
+// Run this beside Cost Management filtered to the Foundry resource. Both
+// tables live in the same workspace, so no cross-resource app() call is needed:
+//
+// AppMetrics
+// | where TimeGenerated > ago(30d)
+// | where Name == "Total Tokens"
+// | extend Model = tostring(Properties.Model)
+// | summarize GatewayTokens = sum(Sum) by Model, bin(TimeGenerated, 1d)
+// | order by TimeGenerated desc
+//
+// Note the table name. This is workspace-based App Insights, so it is
+// AppMetrics / Properties / Sum, NOT customMetrics / customDimensions /
+// valueSum. See the header of 01-token-attribution.kql — reading the wrong
+// table returns an empty result with no error and looks like a broken policy.

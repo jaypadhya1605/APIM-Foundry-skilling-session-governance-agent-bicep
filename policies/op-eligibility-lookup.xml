@@ -1,0 +1,49 @@
+<!--
+  ============================================================================
+  OPERATION SCOPE  |  clinical-tools / eligibility-lookup
+  ============================================================================
+  Mocked so the egress demo needs no downstream system. Everything that matters
+  in Session 2/policies/api-clinical-tools.xml — JWT validation, per-agent rate
+  limit, argument validation, header scrubbing — has already run by the time
+  this returns. Swap the mock for `set-backend-service` and nothing else in the
+  governance chain changes, which is the point worth making: the controls are
+  not coupled to the tool.
+  ============================================================================
+-->
+<policies>
+  <inbound>
+    <base />
+    <return-response>
+      <set-status code="200" reason="OK" />
+      <set-header name="Content-Type" exists-action="override">
+        <value>application/json</value>
+      </set-header>
+      <!-- return-response ABORTS the pipeline: the API-scope <outbound> block
+           never runs, so any response header set there is silently missing.
+           Worth knowing before you debug a header that "isn't working" — it is
+           working, the section just never executed. Echo the attribution here
+           so the demo can show which agent identity the gateway resolved. -->
+      <set-header name="x-prov-agent-app-id" exists-action="override">
+        <value>@((string)context.Variables.GetValueOrDefault("agentAppId", "unknown"))</value>
+      </set-header>
+      <set-header name="x-prov-correlation-id" exists-action="override">
+        <value>@(context.RequestId.ToString())</value>
+      </set-header>
+      <set-body>@{
+          var memberId = context.Request.Url.Query.GetValueOrDefault("memberId", "PRV-00000000");
+          return new JObject(
+              new JProperty("memberId", memberId),
+              new JProperty("eligible", true),
+              new JProperty("planCode", "PRV-HMO-GOLD"),
+              new JProperty("effectiveDate", "2026-01-01"),
+              new JProperty("copayUsd", 25),
+              new JProperty("source", "mock-eligibility-service"),
+              new JProperty("governedBy", "apim-clinical-tools")
+          ).ToString();
+      }</set-body>
+    </return-response>
+  </inbound>
+  <backend><base /></backend>
+  <outbound><base /></outbound>
+  <on-error><base /></on-error>
+</policies>

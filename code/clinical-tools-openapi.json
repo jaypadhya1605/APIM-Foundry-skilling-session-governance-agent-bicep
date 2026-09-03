@@ -1,0 +1,65 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Providence Clinical Tools (governed egress)",
+    "version": "1.0.0",
+    "description": "Internal Providence capabilities exposed to Foundry Agents THROUGH Azure API Management. The agent never receives the address of the internal system, never holds its credential, and cannot exceed the rate limit the gateway applies. Swapping the APIM operation's mock for a real backend requires no change to this document and no redeployment of any agent."
+  },
+  "servers": [
+    {
+      "url": "https://apim-provdemo-vzl7w5xjytej4.azure-api.net/tools/clinical",
+      "description": "APIM gateway. NOT the internal eligibility service address, which is deliberately not published to agents."
+    }
+  ],
+  "paths": {
+    "/eligibility": {
+      "get": {
+        "operationId": "eligibility_lookup",
+        "summary": "Look up a Providence member's current benefit eligibility.",
+        "description": "Returns plan code, effective date and copay for a member. Use ONLY when the member id is already known and stated by the user. Do not guess or enumerate member ids: the gateway rejects any value that does not match PRV-######## and records the attempt against the calling agent's identity.",
+        "parameters": [
+          {
+            "name": "memberId",
+            "in": "query",
+            "required": true,
+            "description": "Providence member id in the form PRV-12345678.",
+            "schema": {
+              "type": "string",
+              "pattern": "^PRV-[0-9]{8}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Eligibility record.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "memberId": { "type": "string" },
+                    "eligible": { "type": "boolean" },
+                    "planCode": { "type": "string" },
+                    "effectiveDate": { "type": "string", "format": "date" },
+                    "copayUsd": { "type": "number" },
+                    "source": { "type": "string" },
+                    "governedBy": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The gateway rejected a model-authored argument that did not match the contract."
+          },
+          "401": {
+            "description": "The agent's Entra token was missing, expired, or issued for the wrong audience."
+          },
+          "429": {
+            "description": "The calling agent exceeded its per-agent rate limit. Back off; do not retry immediately in a loop."
+          }
+        }
+      }
+    }
+  }
+}

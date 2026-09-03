@@ -1,0 +1,9 @@
+# Session 2 — governance, agents and egress samples
+#
+# Verified against the live gateway on 2026-08-23.
+
+azure-ai-projects>=1.0.0
+azure-ai-agents>=1.0.0
+azure-identity>=1.19.0
+requests>=2.32.0
+python-dotenv>=1.0.1

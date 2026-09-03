@@ -1,0 +1,181 @@
+<!--
+  ============================================================================
+  PRODUCT SCOPE  |  Foundry — Team Cardiology AI   (SESSION 2: governed)
+  ============================================================================
+  This is the Session 1 product policy with the governance stack added. Diff it
+  against Session 1/policies/product-team-cardiology.xml during the session —
+  the whole of ask 4 is the block between the two comment markers below, and
+  nothing above it changed. That is the argument for putting governance at the
+  product scope: onboarding a team is a copy of this file with four values
+  edited, and it inherits every control automatically.
+
+  ORDER MATTERS, AND IT IS NOT ARBITRARY
+  ======================================
+    1. identity / attribution   cheap, and everything downstream keys off it
+    2. token quota              reject over-budget traffic before paying for
+                                a content-safety call on it
+    3. content safety           reject unsafe traffic before paying Foundry
+    4. token metric emission    must run so it also counts the requests that
+                                the two gates above rejected, otherwise the
+                                chargeback report under-reports the teams that
+                                are behaving worst
+
+  Put content safety first and you pay a Content Safety transaction for every
+  request a quota would have rejected for free. Put the metric last and you
+  cannot see who is generating the rejections.
+  ============================================================================
+-->
+<policies>
+  <inbound>
+    <base />
+
+    <!-- ══ UNCHANGED FROM SESSION 1 ═════════════════════════════════════ -->
+    <set-variable name="allowedProjects" value="proj-personal-demo-usage" />
+    <set-variable name="reasoningEffortDefault" value="medium" />
+    <set-variable name="costCenter" value="CC-41180-CARDIOLOGY" />
+    <set-variable name="serviceTier" value="clinical-standard" />
+
+    <!-- ══ SESSION 2 GOVERNANCE STACK ═══════════════════════════════════ -->
+    <!-- ── 0. Resolve the model HERE, at product scope ──────────────────
+         This looks like duplication of the API policy and is not.
+
+         Inbound policies evaluate outermost-first:
+
+             global  →  PRODUCT  →  api  →  operation
+
+         so anything the API policy sets does not exist yet when this product
+         policy runs. llm-emit-token-metric is an inbound-only policy, and its
+         dimension expressions are evaluated at that point — which means
+
+             <dimension name="Model" value="...context.Variables["modelName"]..." />
+
+         silently emits "unresolved" for every single request. Nothing errors.
+         The metric appears, the dashboard renders, and the Model axis is
+         useless. We shipped exactly that bug while building this session and
+         only caught it by reading the emitted dimensions.
+
+         Resolving it here is four lines and makes the product policy
+         self-contained: it does not depend on any particular API having run
+         first, so it behaves identically on all four published APIs. -->
+    <set-variable name="modelName" value="@{
+        var m = System.Text.RegularExpressions.Regex.Match(context.Request.Url.Path, @&quot;/deployments/([^/?]+)&quot;);
+        if (m.Success) { return m.Groups[1].Value; }
+        var body = context.Request.Body?.As&lt;JObject&gt;(preserveContent: true);
+        return body?[&quot;model&quot;]?.ToString() ?? &quot;unresolved&quot;;
+    }" />
+    <!-- ── 1. Token quota and rate  (ask 4) ───────────────────────────────
+         Two limits, one policy, and they answer two different questions.
+
+         tokens-per-minute  = protection. Stops one runaway agent loop from
+                              consuming the shared Foundry PTU/TPM allocation
+                              and 429-ing every other team on the platform.
+                              This is a NOISY-NEIGHBOUR control.
+
+         token-quota        = budget. A hard ceiling per renewal period. This
+                              is a FINANCIAL control and it is the one that
+                              makes "AI spend" predictable enough to sign off.
+
+         counter-key is context.Subscription.Id — the app, not the team. Two
+         apps from the same team must not be able to consume each other's
+         budget, or the first incident is a blame argument with no data.
+
+         estimate-prompt-tokens="false" means APIM waits for the real usage
+         block from the model response rather than tokenising locally. More
+         accurate, and it is the only option that also counts completion
+         tokens correctly for reasoning models, where hidden reasoning tokens
+         dominate the bill. The cost is that the limit is enforced on the NEXT
+         request, not this one — a deliberate accuracy-over-immediacy trade.
+         For streaming responses set it to true, because there is no usage
+         block to wait for.
+
+         retry-after-header-name gives the SDK something to honour, which turns
+         a hard failure into a backoff. Without it the client library retries
+         immediately and makes the throttle worse. -->
+    <llm-token-limit counter-key="@((string)context.Subscription.Id)"
+                     tokens-per-minute="20000"
+                     token-quota="15000000"
+                     token-quota-period="Monthly"
+                     estimate-prompt-tokens="false"
+                     retry-after-header-name="retry-after"
+                     remaining-quota-tokens-header-name="x-prov-quota-tokens-remaining"
+                     remaining-tokens-header-name="x-prov-tpm-remaining"
+                     tokens-consumed-header-name="x-prov-tokens-consumed" />
+
+    <!-- ── 2. Content safety  (ask 4) ─────────────────────────────────────
+         This is NOT the same thing as the content filter attached to the model
+         deployment, and the difference is the reason to run both.
+
+           Deployment filter  runs inside Foundry, per deployment. A team that
+                              reaches a different deployment, a partner model,
+                              or a different Foundry resource escapes it.
+           Gateway policy     runs on every request that crosses the platform
+                              boundary, regardless of which model it targets,
+                              and it is administered by the platform team
+                              rather than by whoever created the deployment.
+
+         For a health system the second property is the one that matters: the
+         control has to be provably uniform across every model, or it cannot be
+         cited in an attestation.
+
+         shield-prompt="true" enables Prompt Shields — jailbreak and indirect
+         prompt-injection detection. For an agent that ingests documents,
+         indirect injection is the realistic attack: hostile text inside a
+         referral letter instructing the agent to exfiltrate. This is the only
+         control here that addresses it.
+
+         Severity thresholds are 0/2/4/6. 2 is deliberately tight for clinical
+         traffic. Expect to tune Violence upward first — clinical notes legitimately
+         describe injury, and a threshold set by intuition rather than by
+         replaying real traffic will generate false positives on trauma cases
+         within a week. Tune against a corpus, not against a meeting. -->
+    <llm-content-safety backend-id="content-safety" shield-prompt="true">
+      <categories output-type="EightSeverityLevels">
+        <category name="Hate" threshold="2" />
+        <category name="SelfHarm" threshold="2" />
+        <category name="Sexual" threshold="2" />
+        <category name="Violence" threshold="4" />
+      </categories>
+    </llm-content-safety>
+
+    <!-- ── 3. Token metric emission  (ask 4) ──────────────────────────────
+         This is what makes chargeback possible. It emits prompt, completion and
+         total token counts to Application Insights as a custom metric, split by
+         the dimensions below.
+
+         Dimensions are capped at 10 and they are the ONLY axes the finance
+         report can ever slice on. Choosing them is a one-way door: a dimension
+         not emitted today cannot be back-filled from historical telemetry.
+         Pick the keys the invoice has to be reconciled against —
+         cost centre, team, app, model — not the ones that are interesting.
+
+         `Model` is populated from the API-scope modelName variable rather than
+         from the deployment name, so the metric stays correct when a team is
+         moved between deployments of the same model.
+
+         Cost is deliberately NOT computed here. Prices change, and a price
+         baked into a policy becomes wrong silently. Emit tokens; join to a
+         price table in the report. -->
+    <llm-emit-token-metric namespace="providence-ai-gateway">
+      <dimension name="CostCenter" value="@((string)context.Variables["costCenter"])" />
+      <dimension name="Team" value="@(context.Product?.Id ?? "unscoped")" />
+      <dimension name="App" value="@(context.Subscription?.Id ?? "anonymous")" />
+      <dimension name="Model" value="@(context.Variables.ContainsKey("modelName") ? (string)context.Variables["modelName"] : "unresolved")" />
+      <dimension name="ServiceTier" value="@((string)context.Variables["serviceTier"])" />
+      <dimension name="ApiId" value="@(context.Api.Id)" />
+    </llm-emit-token-metric>
+  </inbound>
+
+  <backend><base /></backend>
+
+  <outbound>
+    <base />
+    <set-header name="x-prov-cost-center" exists-action="override">
+      <value>@((string)context.Variables["costCenter"])</value>
+    </set-header>
+    <set-header name="x-prov-service-tier" exists-action="override">
+      <value>@((string)context.Variables["serviceTier"])</value>
+    </set-header>
+  </outbound>
+
+  <on-error><base /></on-error>
+</policies>

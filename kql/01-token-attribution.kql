@@ -1,0 +1,173 @@
+// =============================================================================
+// Token attribution — who spent what, on which model, for which cost centre
+// =============================================================================
+// This is the query that answers the question Providence's finance and platform
+// teams will ask within a month of go-live and cannot answer today:
+//
+//     "Foundry billed us $X. Which teams, and which applications, caused it?"
+//
+// Azure Cost Management can tell you what a Foundry deployment cost. It cannot
+// tell you that 62% of it was the revenue-cycle denial-summarisation batch job,
+// because from Azure's point of view there is one resource and one meter. The
+// dimensions below exist only because the gateway stamped them on every call.
+//
+// SCOPE: Log Analytics workspace log-provdemo-...
+//
+// -----------------------------------------------------------------------------
+// WHICH TABLE, AND WHY THIS TRIPS PEOPLE UP
+// -----------------------------------------------------------------------------
+// Nearly every sample you will find online — including Microsoft's own — uses
+//
+//     customMetrics | extend Team = tostring(customDimensions["Team"])
+//
+// That is the CLASSIC Application Insights schema. Workspace-based App Insights
+// resources — the default now, and what this platform uses — store the same
+// telemetry in the Log Analytics workspace under different table and column
+// names:
+//
+//     classic                    workspace-based
+//     ------------------------   ------------------------
+//     customMetrics              AppMetrics
+//     customDimensions           Properties
+//     requests                   AppRequests
+//     traces                     AppTraces
+//     dependencies               AppDependencies
+//     exceptions                 AppExceptions
+//     valueSum                   Sum
+//     timestamp                  TimeGenerated
+//
+// Querying customMetrics from the Log Analytics blade returns an empty result
+// with no error, which reads exactly like "the metric policy isn't working".
+// It is working — you are reading the wrong table. This cost a debugging cycle
+// while building this session, and it is the single most likely reason a
+// Providence engineer will conclude token metrics are broken.
+//
+// (The classic aliases DO still resolve inside the Application Insights > Logs
+// blade, which is why the same query appears to work for one person and not
+// another. Prefer the workspace names: they work from both places.)
+//
+// PREREQUISITE that silently breaks everything below: the APIM diagnostic must
+// have metrics = true. See Session 1/infra/02-ai-gateway.bicep. Without it
+// these tables are empty and, again, nothing errors.
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// 1. Spend by cost centre and team — the chargeback report
+// -----------------------------------------------------------------------------
+AppMetrics
+| where TimeGenerated > ago(7d)
+| where Name in ("Total Tokens", "Prompt Tokens", "Completion Tokens")
+| extend
+    CostCenter  = tostring(Properties.CostCenter),
+    Team        = tostring(Properties.Team),
+    App         = tostring(Properties.App),
+    Model       = tostring(Properties.Model),
+    ServiceTier = tostring(Properties.ServiceTier),
+    ApiId       = tostring(Properties.ApiId)
+| summarize Tokens = sum(Sum) by CostCenter, Team, Model, Name
+| evaluate pivot(Name, sum(Tokens))
+| order by CostCenter asc, Team asc
+
+// -----------------------------------------------------------------------------
+// 2. Daily trend per team — the capacity conversation
+// -----------------------------------------------------------------------------
+// Run separately. Growth rate matters more than the absolute number: a team
+// doubling week over week needs a PTU conversation before it hits the quota,
+// not after.
+//
+// AppMetrics
+// | where TimeGenerated > ago(30d)
+// | where Name == "Total Tokens"
+// | extend Team = tostring(Properties.Team)
+// | summarize Tokens = sum(Sum) by bin(TimeGenerated, 1d), Team
+// | render timechart
+
+// -----------------------------------------------------------------------------
+// 3. Prompt-to-completion ratio by application — the optimisation signal
+// -----------------------------------------------------------------------------
+// A very high prompt:completion ratio usually means an application is stuffing
+// the same static context into every call. That is the cheapest cost saving
+// available and it needs no model change: cache it, or move it to a system
+// message the provider can cache. This query finds those applications without
+// anybody having to volunteer that they exist.
+//
+// AppMetrics
+// | where TimeGenerated > ago(7d)
+// | where Name in ("Prompt Tokens", "Completion Tokens")
+// | extend App = tostring(Properties.App), Team = tostring(Properties.Team)
+// | summarize Tokens = sum(Sum) by App, Team, Name
+// | evaluate pivot(Name, sum(Tokens))
+// | extend Ratio = round(todouble(['Prompt Tokens']) / todouble(['Completion Tokens']), 1)
+// | where ['Prompt Tokens'] > 100000
+// | order by Ratio desc
+
+// -----------------------------------------------------------------------------
+// 4. Reasoning-token overhead and cache hit rate — the gpt-5-class question
+// -----------------------------------------------------------------------------
+// llm-emit-token-metric emits more than three counters. The full set observed
+// on this platform:
+//
+//     Total Tokens                   Prompt Cached Tokens
+//     Prompt Tokens                  Prompt Audio Tokens
+//     Completion Tokens              Completion Audio Tokens
+//     Completion Reasoning Tokens    Completion Accepted Prediction Tokens
+//                                    Completion Rejected Prediction Tokens
+//
+// Two of those deserve a dashboard tile of their own:
+//
+//   Completion Reasoning Tokens — billed, invisible to the user, and driven by
+//     the reasoning-effort setting. If this is a large fraction of completion
+//     tokens on a simple classification workload, the effort level is wrong.
+//     This is exactly what the product policy's reasoningEffortDefault exists
+//     to control, and this is how you prove the setting was worth having.
+//
+//   Prompt Cached Tokens — tokens served from the provider's prompt cache at a
+//     discount. A rising cached-token share is the measurable payoff from
+//     restructuring prompts so the stable part comes first.
+//
+// AppMetrics
+// | where TimeGenerated > ago(7d)
+// | where Name in ("Completion Tokens", "Completion Reasoning Tokens", "Prompt Cached Tokens", "Prompt Tokens")
+// | extend Team = tostring(Properties.Team), Model = tostring(Properties.Model)
+// | summarize Tokens = sum(Sum) by Team, Model, Name
+// | evaluate pivot(Name, sum(Tokens))
+// | extend ReasoningSharePct = round(100.0 * todouble(['Completion Reasoning Tokens']) / todouble(['Completion Tokens']), 1)
+// | extend CacheHitSharePct  = round(100.0 * todouble(['Prompt Cached Tokens']) / todouble(['Prompt Tokens']), 1)
+// | order by ReasoningSharePct desc
+
+// -----------------------------------------------------------------------------
+// 5. Model mix — is anyone using a frontier model for a trivial job
+// -----------------------------------------------------------------------------
+// AppMetrics
+// | where TimeGenerated > ago(7d)
+// | where Name == "Total Tokens"
+// | extend Team = tostring(Properties.Team), Model = tostring(Properties.Model)
+// | summarize Tokens = sum(Sum) by Team, Model
+// | order by Tokens desc
+
+// =============================================================================
+// A NOTE ON DIMENSION DISCIPLINE
+// =============================================================================
+// Every product policy emits the SAME six dimensions: CostCenter, Team, App,
+// Model, ServiceTier, ApiId. That uniformity is a platform contract, not a
+// stylistic preference. The moment one team adds a seventh dimension or renames
+// Team to TeamName, every query above needs a special case for that team, and
+// six months later the reporting layer is a pile of exceptions nobody trusts.
+//
+// Enforce it by keeping the emit-metric block identical across product policies
+// and reviewing changes to it in a pull request. The values differ per team;
+// the KEYS must not.
+//
+// Two hard limits worth knowing before you settle the dimension set:
+//   * a maximum of 10 dimensions per emit-metric policy, and
+//   * dimensions are the only axes the report can EVER slice on. Adding one
+//     later does not backfill history. Choosing them is a one-way door.
+//
+// One more scope trap, which we hit live: inbound policies evaluate
+// global → product → api → operation, and llm-emit-token-metric is
+// inbound-only. A dimension that reads a variable set by the API policy will
+// therefore emit an empty value from a PRODUCT-scoped emit block — silently.
+// Our Model dimension read "unresolved" on every row until we resolved the
+// model inside the product policy itself. Always check the emitted dimensions
+// once, in the portal, before you build a dashboard on top of them.
+// =============================================================================
